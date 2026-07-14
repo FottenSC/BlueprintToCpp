@@ -54,8 +54,20 @@ public static class Program
 
             var provider = InitializeProvider(pakFolderPath, usmapPath, version);
             provider.ReadScriptData = true;
-            Console.WriteLine("If the game is not fortnite and the game is encrypted, modify aes.json file.");
-            await LoadAesKeysAsync(provider,"https://export-service-new.dillyapis.com/v1/aes"); // allow users to change the aes url?
+            var hasPakContainers = Directory.EnumerateFiles(
+                    pakFolderPath,
+                    "*.pak",
+                    SearchOption.TopDirectoryOnly)
+                .Any();
+            if (hasPakContainers)
+            {
+                Console.WriteLine("If the game is not fortnite and the game is encrypted, modify aes.json file.");
+                await LoadAesKeysAsync(provider,"https://export-service-new.dillyapis.com/v1/aes"); // allow users to change the aes url?
+            }
+            else
+            {
+                provider.PostMount();
+            }
 
             var files = new Dictionary<string, GameFile[]>();
 
