@@ -1,6 +1,6 @@
 {
   "PakFolderPath": "E:/myMods/dump/SoulcaliburVI",
-  "BlueprintPath": "Content/UI/MenuElement/MenuWindow/VersusWindow",
+  "BlueprintPath": "Content/UI/GameFlow/GameScenes/Battle/OnlineBattleSceneBase.uasset",
   "UsmapPath": "",
   "Version": "GAME_UE4_17"
 }

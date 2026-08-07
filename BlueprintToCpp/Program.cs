@@ -1,5 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
+using System.Buffers.Binary;
 using Newtonsoft.Json.Linq;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.UE4.Versions;
@@ -20,6 +22,25 @@ public static class Program
     private static readonly Regex DynamicCastRegex = new Regex(@"K2Node_DynamicCast_([A-Za-z0-9_]+)", RegexOptions.Compiled);
     private static readonly Regex K2NodeRegex = new Regex(@"K2Node_([A-Za-z0-9_]+)", RegexOptions.Compiled);
 
+    // UE4 package NameMap entries serialize an FString immediately after a
+    // little-endian signed character count (including the trailing NUL).
+    // Prefiltering the small .uasset/.umap header this way avoids loading the
+    // often very large companion .uexp merely to discover that a name cannot
+    // occur. Full CUE4Parse validation still runs for every raw candidate.
+    private static bool ContainsSerializedPackageName(
+        ReadOnlySpan<byte> bytes, string name)
+    {
+        if (string.IsNullOrEmpty(name) || !name.All(c => c <= 0x7f))
+            return false;
+
+        var encoded = Encoding.ASCII.GetBytes(name);
+        var serialized = new byte[sizeof(int) + encoded.Length + 1];
+        BinaryPrimitives.WriteInt32LittleEndian(
+            serialized.AsSpan(0, sizeof(int)), encoded.Length + 1);
+        encoded.CopyTo(serialized.AsSpan(sizeof(int)));
+        return bytes.IndexOf(serialized) >= 0;
+    }
+
     public static async Task Main(string[] args)
     {
         try
@@ -27,6 +48,160 @@ public static class Program
 #if DEBUG
             //Log.Logger = new LoggerConfiguration().WriteTo.Console(theme: AnsiConsoleTheme.Literate).CreateLogger();
 #endif
+            // Raw Lux battle assets (.khd/.mot/.mif/.khi/.dat) are ordinary
+            // files in SC6's pak, not UObject packages.  Keep this narrow mode
+            // separate from Blueprint decompilation so reverse-engineering
+            // tools can inspect/list them without pretending they are assets.
+            if (args.Length >= 3 && args[0] == "--list-raw")
+            {
+                var rawProvider = InitializeProvider(args[1], string.Empty, EGame.GAME_UE4_17);
+                rawProvider.PostMount();
+                Console.Error.WriteLine($"Mounted {rawProvider.Files.Count} files from {rawProvider.MountedVfs.Count} containers; {rawProvider.UnloadedVfs.Count} unloaded; {rawProvider.RequiredKeys.Count} keys required");
+                foreach (var file in rawProvider.Files.Values
+                             .Where(file => file.Path.Contains(args[2], StringComparison.OrdinalIgnoreCase))
+                             .OrderBy(file => file.Path, StringComparer.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"{file.Path}\t{file.Size}");
+                }
+                return;
+            }
+
+            if (args.Length >= 4 && args[0] == "--extract-raw")
+            {
+                var rawProvider = InitializeProvider(args[1], string.Empty, EGame.GAME_UE4_17);
+                rawProvider.PostMount();
+                Console.Error.WriteLine($"Mounted {rawProvider.Files.Count} files from {rawProvider.MountedVfs.Count} containers; {rawProvider.UnloadedVfs.Count} unloaded; {rawProvider.RequiredKeys.Count} keys required");
+                var outputRoot = Path.GetFullPath(args[3]);
+                foreach (var file in rawProvider.Files.Values
+                             .Where(file => file.Path.Contains(args[2], StringComparison.OrdinalIgnoreCase))
+                             .OrderBy(file => file.Path, StringComparer.OrdinalIgnoreCase))
+                {
+                    var relative = file.Path.Replace('/', Path.DirectorySeparatorChar);
+                    var outputPath = Path.GetFullPath(Path.Combine(outputRoot, relative));
+                    if (!outputPath.StartsWith(outputRoot + Path.DirectorySeparatorChar,
+                                               StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException($"Refusing path outside output root: {file.Path}");
+                    }
+                    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+                    File.WriteAllBytes(outputPath, file.Read());
+                    Console.WriteLine($"{file.Path}\t{file.Size}\t{outputPath}");
+                }
+                return;
+            }
+
+            // Search cooked package name maps without materializing every asset.
+            // This is useful when auditing whether a native Blueprint-callable
+            // function is reachable from stock content: UE serializes referenced
+            // function names in the package name map even when the bytecode lives
+            // in the companion .uexp file.
+            if (args.Length >= 3 && args[0] == "--find-package-name")
+            {
+                var packageSearch = Directory.EnumerateFiles(args[1], "*.pak", SearchOption.TopDirectoryOnly).Any()
+                    ? SearchOption.TopDirectoryOnly : SearchOption.AllDirectories;
+                var searchProvider = InitializeProvider(args[1], string.Empty, EGame.GAME_UE4_17,
+                    packageSearch);
+                searchProvider.PostMount();
+                var needle = args[2];
+                var pathPrefix = args.Length >= 4 ? args[3] : string.Empty;
+                var candidates = searchProvider.Files.Values
+                    .Where(file =>
+                        (file.Path.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) ||
+                         file.Path.EndsWith(".umap", StringComparison.OrdinalIgnoreCase)) &&
+                        (string.IsNullOrEmpty(pathPrefix) ||
+                         file.Path.StartsWith(pathPrefix, StringComparison.OrdinalIgnoreCase)))
+                    .ToArray();
+                var matches = new ConcurrentBag<string>();
+                var failures = 0;
+
+                Parallel.ForEach(candidates, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
+                {
+                    try
+                    {
+                        var package = searchProvider.LoadPackage(file.Path);
+                        if (package.NameMap.Any(entry => string.Equals(entry.Name, needle, StringComparison.Ordinal)))
+                            matches.Add(file.Path);
+                    }
+                    catch
+                    {
+                        Interlocked.Increment(ref failures);
+                    }
+                });
+
+                foreach (var match in matches.OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+                    Console.WriteLine(match);
+                Console.Error.WriteLine($"Scanned {candidates.Length} packages; {matches.Count} matches; {failures} parse failures");
+                return;
+            }
+
+            // Multi-name form of the reachability audit above. Mounting and
+            // parsing the complete stock SC6 package set dominates the cost,
+            // so resolve all requested UFunction names in one pass instead of
+            // remounting roughly 49,000 packages once per native thunk.
+            if (args.Length >= 3 && args[0] == "--find-package-names")
+            {
+                var packageSearch = Directory.EnumerateFiles(args[1], "*.pak", SearchOption.TopDirectoryOnly).Any()
+                    ? SearchOption.TopDirectoryOnly : SearchOption.AllDirectories;
+                var searchProvider = InitializeProvider(args[1], string.Empty, EGame.GAME_UE4_17,
+                    packageSearch);
+                searchProvider.PostMount();
+                Console.Error.WriteLine($"Mounted {searchProvider.Files.Count} files from {searchProvider.MountedVfs.Count} containers; {searchProvider.UnloadedVfs.Count} unloaded; {searchProvider.RequiredKeys.Count} keys required");
+                var needles = args.Skip(2)
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray();
+                if (needles.Length == 0)
+                    throw new ArgumentException("At least one package name is required");
+                var needleSet = new HashSet<string>(needles, StringComparer.Ordinal);
+                var candidates = searchProvider.Files.Values
+                    .Where(file =>
+                        file.Path.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) ||
+                        file.Path.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                var matches = new ConcurrentBag<(string Name, string Path)>();
+                var rawCandidates = new ConcurrentBag<GameFile>();
+                var rawFailures = 0;
+                var failures = 0;
+
+                Parallel.ForEach(candidates, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
+                {
+                    try
+                    {
+                        var header = file.Read();
+                        if (needles.Any(needle =>
+                                ContainsSerializedPackageName(header, needle)))
+                            rawCandidates.Add(file);
+                    }
+                    catch
+                    {
+                        Interlocked.Increment(ref rawFailures);
+                    }
+                });
+
+                Parallel.ForEach(rawCandidates, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
+                {
+                    try
+                    {
+                        var package = searchProvider.LoadPackage(file.Path);
+                        foreach (var entry in package.NameMap)
+                            if (needleSet.Contains(entry.Name))
+                                matches.Add((entry.Name, file.Path));
+                    }
+                    catch
+                    {
+                        Interlocked.Increment(ref failures);
+                    }
+                });
+
+                foreach (var match in matches
+                             .Distinct()
+                             .OrderBy(value => value.Name, StringComparer.Ordinal)
+                             .ThenBy(value => value.Path, StringComparer.OrdinalIgnoreCase))
+                    Console.WriteLine($"{match.Name}\t{match.Path}");
+                Console.Error.WriteLine($"Scanned {candidates.Length} package headers for {needles.Length} names; {rawCandidates.Count} raw candidates; {matches.Count} matches; {rawFailures} header read failures; {failures} candidate parse failures");
+                return;
+            }
+
             var config = Utils.LoadConfig("config.json");
 
             string pakFolderPath = config.PakFolderPath;
@@ -172,12 +347,13 @@ public static class Program
         }
     }
 
-    static DefaultFileProvider InitializeProvider(string pakFolderPath, string usmapPath, EGame version)
+    static DefaultFileProvider InitializeProvider(string pakFolderPath, string usmapPath, EGame version,
+        SearchOption searchOption = SearchOption.AllDirectories)
     {
         OodleHelper.Initialize(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, OodleHelper.OODLE_NAME_CURRENT));
         ZlibHelper.Initialize(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ZlibHelper.DLL_NAME));
 
-        var provider = new DefaultFileProvider(pakFolderPath, SearchOption.AllDirectories, true, new VersionContainer(version));
+        var provider = new DefaultFileProvider(pakFolderPath, searchOption, true, new VersionContainer(version));
 
         if (!string.IsNullOrEmpty(usmapPath) && usmapPath.Length > 0)
         {
