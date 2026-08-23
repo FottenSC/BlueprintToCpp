@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using System.Collections.Concurrent;
 using System.Buffers.Binary;
 using Newtonsoft.Json.Linq;
+using Newtonsoft.Json;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse.Compression;
@@ -11,6 +12,8 @@ using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
 using CUE4Parse.UE4.Objects.UObject;
+using CUE4Parse.UE4.Assets.Exports.Animation;
+using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.Utils;
 
 namespace Main;
@@ -86,6 +89,120 @@ public static class Program
                     Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
                     File.WriteAllBytes(outputPath, file.Read());
                     Console.WriteLine($"{file.Path}\t{file.Size}\t{outputPath}");
+                }
+                return;
+            }
+
+            // Export the cooked reference skeleton in a stable, compact form for
+            // static Lux motion/KHit analysis.  The provider resolves each loose
+            // .uasset together with its adjacent .uexp companion.
+            if (args.Length >= 3 && args[0] == "--export-skeleton")
+            {
+                var skeletonProvider = InitializeProvider(args[1], string.Empty, EGame.GAME_UE4_17);
+                skeletonProvider.PostMount();
+                var requestedPath = args[2].Replace('\\', '/');
+                var package = skeletonProvider.LoadPackage(requestedPath);
+                var exports = package.GetExports().ToArray();
+                var referenceSkeleton = exports.OfType<USkeleton>().SingleOrDefault()?.ReferenceSkeleton
+                    ?? exports.OfType<USkeletalMesh>().SingleOrDefault()?.ReferenceSkeleton
+                    ?? throw new InvalidDataException(
+                        $"No USkeleton or USkeletalMesh reference skeleton in {requestedPath}");
+
+                var result = new
+                {
+                    source = requestedPath,
+                    bones = referenceSkeleton.FinalRefBoneInfo.Select((bone, index) =>
+                    {
+                        var pose = referenceSkeleton.FinalRefBonePose[index];
+                        return new
+                        {
+                            index,
+                            name = bone.Name.Text,
+                            parent = bone.ParentIndex,
+                            rotation = new[] { pose.Rotation.X, pose.Rotation.Y, pose.Rotation.Z, pose.Rotation.W },
+                            translation = new[] { pose.Translation.X, pose.Translation.Y, pose.Translation.Z },
+                            scale = new[] { pose.Scale3D.X, pose.Scale3D.Y, pose.Scale3D.Z },
+                        };
+                    }),
+                };
+                var json = JsonConvert.SerializeObject(result, Formatting.Indented) + Environment.NewLine;
+                if (args.Length >= 4)
+                {
+                    var outputPath = Path.GetFullPath(args[3]);
+                    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+                    File.WriteAllText(outputPath, json, new UTF8Encoding(false));
+                    Console.Error.WriteLine($"Skeleton JSON written to {outputPath}");
+                }
+                else
+                {
+                    Console.Write(json);
+                }
+                return;
+            }
+
+            // Export every UObject in one loose cooked package as CUE4Parse's
+            // stable JSON projection.  Static battle-science tools use this
+            // for RegularProfile values (BODY/UPPER/LOWER scales and related
+            // setup) without launching the game or approximating UObject
+            // property serialization themselves.
+            if (args.Length >= 3 && args[0] == "--export-package-json")
+            {
+                var packageProvider = InitializeProvider(args[1], string.Empty, EGame.GAME_UE4_17);
+                packageProvider.PostMount();
+                var requestedPath = args[2].Replace('\\', '/');
+                var exports = packageProvider.LoadPackage(requestedPath).GetExports().ToArray();
+                var json = JsonConvert.SerializeObject(exports, Formatting.Indented) + Environment.NewLine;
+                if (args.Length >= 4)
+                {
+                    var outputPath = Path.GetFullPath(args[3]);
+                    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+                    File.WriteAllText(outputPath, json, new UTF8Encoding(false));
+                    Console.Error.WriteLine($"Package JSON written to {outputPath}");
+                }
+                else
+                {
+                    Console.Write(json);
+                }
+                return;
+            }
+
+            // Compact projection of the RegularProfile fields consumed by
+            // native collision-reference rescaling.  Keeping this separate
+            // from the generic package dump gives static analyzers a small,
+            // deterministic shipped-asset input.
+            if (args.Length >= 3 && args[0] == "--export-regular-profile")
+            {
+                var profileProvider = InitializeProvider(args[1], string.Empty, EGame.GAME_UE4_17);
+                profileProvider.PostMount();
+                var requestedPath = args[2].Replace('\\', '/');
+                var exports = profileProvider.LoadPackage(requestedPath).GetExports().ToArray();
+                var exportJson = JArray.FromObject(exports);
+                var properties = exportJson
+                    .Select(token => token["Properties"])
+                    .FirstOrDefault(token => token is not null)
+                    ?? throw new InvalidDataException($"No UObject properties in {requestedPath}");
+                var result = new JObject
+                {
+                    ["source"] = requestedPath,
+                    ["character"] = properties["Character"]?.DeepClone(),
+                    ["style"] = properties["Style"]?.DeepClone(),
+                    // UE omits properties equal to class defaults.  An absent
+                    // BodyScales array therefore means the native default
+                    // unit scales, not an unknown parse failure.
+                    ["bodyScales"] = properties["BodyScales"]?.DeepClone() ?? new JArray(),
+                    ["parts"] = properties["Parts"]?.DeepClone() ?? new JArray(),
+                };
+                var json = result.ToString(Formatting.Indented) + Environment.NewLine;
+                if (args.Length >= 4)
+                {
+                    var outputPath = Path.GetFullPath(args[3]);
+                    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+                    File.WriteAllText(outputPath, json, new UTF8Encoding(false));
+                    Console.Error.WriteLine($"RegularProfile JSON written to {outputPath}");
+                }
+                else
+                {
+                    Console.Write(json);
                 }
                 return;
             }
