@@ -39,6 +39,8 @@ If you want to set up AES, run the program once (with the config set), then modi
 
 ## Output
 
+For a UE4.17 loose package, `Main --export-script-json <root> <package-path> <output.json>` exports parsed Kismet expressions with statement offsets. Use these to check pseudocode branch targets; ordinary `--export-package-json` keeps its existing property-only output.
+
 Note: the C++ output may not be 100% accurate.
 
 ## Issues

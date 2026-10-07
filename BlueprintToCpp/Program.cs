@@ -145,9 +145,12 @@ public static class Program
             // for RegularProfile values (BODY/UPPER/LOWER scales and related
             // setup) without launching the game or approximating UObject
             // property serialization themselves.
-            if (args.Length >= 3 && args[0] == "--export-package-json")
+            if (args.Length >= 3 && (args[0] == "--export-package-json" || args[0] == "--export-script-json"))
             {
                 var packageProvider = InitializeProvider(args[1], string.Empty, EGame.GAME_UE4_17);
+                // Opt in to primary Kismet expressions when auditing the
+                // pseudocode's branch targets and inherited timer callbacks.
+                packageProvider.ReadScriptData = args[0] == "--export-script-json";
                 packageProvider.PostMount();
                 var requestedPath = args[2].Replace('\\', '/');
                 var exports = packageProvider.LoadPackage(requestedPath).GetExports().ToArray();
